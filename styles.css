@@ -1,0 +1,219 @@
+ :root {
+     --bg: #f2f0e6;
+     --ink: #1c2a1e;
+     --mut: #5b695d;
+     --card: #fff;
+     --line: #d6d3c2;
+     --acc: #c7361f;
+     --accink: #fff;
+     --ok: #2f7d3b
+ }
+
+ @media (prefers-color-scheme:dark) {
+     :root:not([data-theme="light"]) {
+         --bg: #141914;
+         --ink: #e8eee5;
+         --mut: #9aa89b;
+         --card: #1d241d;
+         --line: #2e3a2e;
+         --acc: #ff6a52;
+         --accink: #1a0b08;
+         --ok: #6fcf7c
+     }
+ }
+
+ :root[data-theme="dark"] {
+     --bg: #141914;
+     --ink: #e8eee5;
+     --mut: #9aa89b;
+     --card: #1d241d;
+     --line: #2e3a2e;
+     --acc: #ff6a52;
+     --accink: #1a0b08;
+     --ok: #6fcf7c
+ }
+
+ :root {
+     box-sizing: border-box;
+     padding-top: env(safe-area-inset-top, 0px);
+     padding-bottom: env(safe-area-inset-bottom, 0px)
+ }
+
+ html {
+     scroll-padding-top: env(safe-area-inset-top, 0px)
+ }
+
+ *,
+ *::before,
+ *::after {
+     box-sizing: inherit
+ }
+
+ body {
+     margin: 0;
+     background: var(--bg);
+     color: var(--ink);
+     font: 16px/1.45 "Avenir Next", "Trebuchet MS", system-ui, sans-serif
+ }
+
+ main {
+     max-width: 640px;
+     margin: 0 auto;
+     padding: 16px
+ }
+
+ h1 {
+     font-size: 1.5rem;
+     margin: .2rem 0 .1rem;
+     letter-spacing: -.01em
+ }
+
+ p.sub {
+     margin: 0 0 14px;
+     color: var(--mut);
+     font-size: .92rem
+ }
+
+ .view {
+     position: relative;
+     background: #0c100c;
+     border-radius: 14px;
+     overflow: hidden;
+     aspect-ratio: 4/3
+ }
+
+ canvas {
+     width: 100%;
+     height: 100%;
+     display: block;
+     object-fit: contain
+ }
+
+ .hint {
+     position: absolute;
+     inset: 0;
+     display: flex;
+     align-items: center;
+     justify-content: center;
+     text-align: center;
+     padding: 24px;
+     color: #cfd8cd;
+     font-size: .95rem
+ }
+
+ .row {
+     display: flex;
+     gap: 8px;
+     flex-wrap: wrap;
+     margin: 12px 0
+ }
+
+ button,
+ .btn {
+     appearance: none;
+     border: 1px solid var(--line);
+     background: var(--card);
+     color: var(--ink);
+     padding: 10px 14px;
+     border-radius: 10px;
+     font: inherit;
+     font-size: .92rem;
+     cursor: pointer
+ }
+
+ button.main {
+     background: var(--acc);
+     color: var(--accink);
+     border-color: var(--acc);
+     font-weight: 600
+ }
+
+ button:focus-visible,
+ input:focus-visible,
+ select:focus-visible {
+     outline: 3px solid var(--acc);
+     outline-offset: 2px
+ }
+
+ .card {
+     background: var(--card);
+     border: 1px solid var(--line);
+     border-radius: 14px;
+     padding: 14px;
+     margin-top: 12px
+ }
+
+ .card h2 {
+     font-size: 1rem;
+     margin: 0 0 10px
+ }
+
+ label {
+     display: block;
+     font-size: .88rem;
+     color: var(--mut);
+     margin-top: 10px
+ }
+
+ label b {
+     color: var(--ink);
+     font-weight: 600
+ }
+
+ input[type=range] {
+     width: 100%;
+     accent-color: var(--acc)
+ }
+
+ input[type=number],
+ select {
+     width: 100%;
+     padding: 9px;
+     border-radius: 8px;
+     border: 1px solid var(--line);
+     background: var(--bg);
+     color: var(--ink);
+     font: inherit
+ }
+
+ .two {
+     display: grid;
+     grid-template-columns: 1fr 1fr;
+     gap: 10px
+ }
+
+ .stats {
+     display: grid;
+     grid-template-columns: repeat(4, 1fr);
+     gap: 8px;
+     text-align: center
+ }
+
+ .stats div {
+     background: var(--bg);
+     border-radius: 10px;
+     padding: 8px 2px
+ }
+
+ .stats strong {
+     display: block;
+     font-size: 1.4rem
+ }
+
+ .stats span {
+     font-size: .78rem;
+     color: var(--mut)
+ }
+
+ #st {
+     font-size: .85rem;
+     color: var(--mut);
+     min-height: 1.3em;
+     margin: 6px 2px
+ }
+
+ .note {
+     font-size: .82rem;
+     color: var(--mut);
+     margin: 8px 0 0
+ }
