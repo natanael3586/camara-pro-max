@@ -10,6 +10,7 @@ vid.muted = true;
 vid.playsInline = true;
 
 let stream = null;
+let facingMode = 'environment'; // 'environment' = trasera, 'user' = frontal
 let timer = null;
 let busy = false;
 let currentSource = null; // 'cam', 'img', 'demo'
@@ -52,12 +53,7 @@ $('green').addEventListener('change', () => {
 });
 
 // --- CÁMARA ---
-async function toggleCamera() {
-    if (stream) {
-        stopCamera();
-        status('Cámara detenida.');
-        return;
-    }
+async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         status('Tu navegador no soporta acceso a la cámara o requiere HTTPS.');
         return;
@@ -66,14 +62,19 @@ async function toggleCamera() {
         status('Solicitando acceso a la cámara...');
         stream = await navigator.mediaDevices.getUserMedia({
             audio: false,
-            video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+            video: {
+                facingMode: { ideal: facingMode },
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            }
         });
         vid.srcObject = stream;
         await vid.play();
         currentSource = 'cam';
         $('hint').hidden = true;
         $('bCam').textContent = 'Detener cámara';
-        status('Cámara activa · Metrología HSV y profundidad');
+        $('bFlip').disabled = false;
+        status(`Cámara activa (${facingMode === 'user' ? 'Frontal' : 'Trasera'}) · Metrología HSV`);
         timer = setInterval(processFrame, 110);
     } catch (err) {
         console.error('Error detallado de cámara:', err);
@@ -82,11 +83,21 @@ async function toggleCamera() {
     }
 }
 
+async function toggleCamera() {
+    if (stream) {
+        stopCamera();
+        status('Cámara detenida.');
+        return;
+    }
+    await startCamera();
+}
+
 function stopCamera() {
     if (timer) { clearInterval(timer); timer = null; }
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     vid.srcObject = null;
     $('bCam').textContent = 'Abrir cámara';
+    $('bFlip').disabled = true;
     if (!staticImg && currentSource === 'cam') {
         $('hint').hidden = false;
         currentSource = null;
@@ -94,6 +105,13 @@ function stopCamera() {
 }
 
 $('bCam').addEventListener('click', toggleCamera);
+
+$('bFlip').addEventListener('click', async () => {
+    if (!stream) return;
+    facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+    stopCamera();
+    await startCamera();
+});
 
 // --- SUBIR FOTO Y MAPA DE PROFUNDIDAD ---
 $('bPhoto').addEventListener('click', () => $('fPhoto').click());
@@ -229,7 +247,7 @@ function processFrame() {
 
     busy = true;
     try {
-        const W = 320; // Resolución aumentada para bordes precisos
+        const W = 320;
         const H = Math.max(180, Math.round(W * (srcH / srcW)));
         work.width = W;
         work.height = H;
