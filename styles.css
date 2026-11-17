@@ -102,6 +102,11 @@ canvas {
     padding: 24px;
     color: #cfd8cd;
     font-size: .95rem;
+    pointer-events: none;
+}
+
+.hint[hidden] {
+    display: none !important;
 }
 
 .row {
@@ -131,6 +136,11 @@ button.main {
     font-weight: 600;
 }
 
+button.btn-sm {
+    padding: 6px 10px;
+    font-size: .82rem;
+}
+
 button:disabled {
     opacity: 0.45;
     cursor: not-allowed;
@@ -149,6 +159,17 @@ select:focus-visible {
     border-radius: 14px;
     padding: 14px;
     margin-top: 12px;
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.card-head h2 {
+    margin: 0;
 }
 
 .card h2 {
