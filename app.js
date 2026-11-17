@@ -11,13 +11,15 @@ vid.playsInline = true;
 
 let stream = null;
 let facingMode = 'environment'; // 'environment' = trasera, 'user' = frontal
+let showDepthView = true;       // Alterna entre mapa de profundidad y color RGB real
 let timer = null;
 let busy = false;
-let currentSource = null; // 'cam', 'img', 'demo'
+let currentSource = null;
 let staticImg = null;
 let customDepthImg = null;
-let focalFactor = 0.78;
+let focalFactor = 0.58;
 let lastDetections = [];
+let lastExportRows = [];
 
 const COLORS = [
     { key: 'green', name: 'Verde', rgb: '#64e991' },
@@ -52,6 +54,41 @@ $('green').addEventListener('change', () => {
     if (currentSource && currentSource !== 'cam') processFrame();
 });
 
+const btnView = $('bView');
+if (btnView) {
+    btnView.addEventListener('click', () => {
+        showDepthView = !showDepthView;
+        btnView.textContent = showDepthView ? 'Vista: Profundidad' : 'Vista: Color real';
+        status(showDepthView ? 'Mostrando mapa de profundidad' : 'Mostrando imagen en color real');
+        if (currentSource && currentSource !== 'cam') {
+            busy = false;
+            processFrame();
+        }
+    });
+}
+
+// --- EXPORTAR RESULTADOS A CSV ---
+const btnCsv = $('bCsv');
+if (btnCsv) {
+    btnCsv.addEventListener('click', () => {
+        if (!lastExportRows.length) {
+            status('No hay detecciones actuales para exportar.');
+            return;
+        }
+        const headers = ['ID', 'Madurez', 'Diametro_cm', 'Distancia_cm', 'Estado'];
+        const csvLines = [
+            headers.join(','),
+            ...lastExportRows.map(r => `${r.id},${r.madurez},${r.diametro},${r.distancia},${r.estado}`)
+        ];
+        const blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `jitomates_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+        link.click();
+        status('Archivo CSV descargado.');
+    });
+}
+
 // --- CÁMARA ---
 async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -73,7 +110,7 @@ async function startCamera() {
         currentSource = 'cam';
         $('hint').hidden = true;
         $('bCam').textContent = 'Detener cámara';
-        $('bFlip').disabled = false;
+        if ($('bFlip')) $('bFlip').disabled = false;
         status(`Cámara activa (${facingMode === 'user' ? 'Frontal' : 'Trasera'}) · Metrología HSV`);
         timer = setInterval(processFrame, 110);
     } catch (err) {
@@ -97,7 +134,7 @@ function stopCamera() {
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     vid.srcObject = null;
     $('bCam').textContent = 'Abrir cámara';
-    $('bFlip').disabled = true;
+    if ($('bFlip')) $('bFlip').disabled = true;
     if (!staticImg && currentSource === 'cam') {
         $('hint').hidden = false;
         currentSource = null;
@@ -106,12 +143,15 @@ function stopCamera() {
 
 $('bCam').addEventListener('click', toggleCamera);
 
-$('bFlip').addEventListener('click', async () => {
-    if (!stream) return;
-    facingMode = (facingMode === 'environment') ? 'user' : 'environment';
-    stopCamera();
-    await startCamera();
-});
+const btnFlip = $('bFlip');
+if (btnFlip) {
+    btnFlip.addEventListener('click', async () => {
+        if (!stream) return;
+        facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+        stopCamera();
+        await startCamera();
+    });
+}
 
 // --- SUBIR FOTO Y MAPA DE PROFUNDIDAD ---
 $('bPhoto').addEventListener('click', () => $('fPhoto').click());
@@ -190,14 +230,15 @@ $('bCal').addEventListener('click', () => {
     const largest = lastDetections[0];
     const realD_mm = parseFloat($('D').value) || 65;
     const realZ_mm = (parseFloat($('cal').value) || 30) * 10;
-    const newFocalPx = (largest.eqDiameterPx * realZ_mm) / realD_mm;
+    const compensatedDiameterPx = largest.eqDiameterPx * 1.12;
+    const newFocalPx = (compensatedDiameterPx * realZ_mm) / realD_mm;
     focalFactor = Math.max(0.2, Math.min(2.5, newFocalPx / largest.W));
     $('fnote').textContent = `Foco calibrado: ${focalFactor.toFixed(2)} × ancho de imagen.`;
     status(`Calibrado con fruto de ${realD_mm} mm a ${realZ_mm / 10} cm.`);
     if (currentSource !== 'cam') processFrame();
 });
 
-// --- CONVERSIÓN HSV Y CLASIFICACIÓN ROBUSTA ---
+// --- CONVERSIÓN HSV Y CLASIFICACIÓN ROBUSTA EN SOMBRA ---
 function rgbToHsv(r, g, b) {
     r /= 255; g /= 255; b /= 255;
     const max = Math.max(r, g, b), min = Math.min(r, g, b);
@@ -214,11 +255,25 @@ function rgbToHsv(r, g, b) {
 
 function classify(r, g, b, includeGreen) {
     const [h, s, v] = rgbToHsv(r, g, b);
-    if (s < 0.38 || v < 0.18) return -1;
-    if ((h <= 14 || h >= 342) && s > 0.45) return 2; // Maduro
-    if (h > 14 && h <= 38 && s > 0.45) return 1;      // Pintón
-    if (includeGreen && h >= 65 && h <= 150 && s > 0.35) return 0; // Verde
+    if (s < 0.32 || v < 0.12) return -1;
+    if ((h <= 15 || h >= 340) && s > 0.38) return 2; // Maduro
+    if (h > 15 && h <= 40 && s > 0.38) return 1;      // Pintón
+    if (includeGreen && h >= 65 && h <= 150 && s > 0.32) return 0; // Verde
     return -1;
+}
+
+// Erosión morfológica de 1 px para separar frutos que se tocan ligeramente
+function erodeMask(mask, W, H) {
+    const out = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) {
+        for (let x = 1; x < W - 1; x++) {
+            const idx = y * W + x;
+            if (mask[idx] && mask[idx - 1] && mask[idx + 1] && mask[idx - W] && mask[idx + W]) {
+                out[idx] = 1;
+            }
+        }
+    }
+    return out;
 }
 
 function depthColormap(val) {
@@ -284,17 +339,19 @@ function processFrame() {
         }
 
         const includeGreen = $('green').checked;
-        const masks = COLORS.map(() => new Uint8Array(W * H));
+        const rawMasks = COLORS.map(() => new Uint8Array(W * H));
         for (let i = 0; i < W * H; i++) {
             const p = i * 4;
             const c = classify(rawData[p], rawData[p + 1], rawData[p + 2], includeGreen);
-            if (c >= 0) masks[c][i] = 1;
+            if (c >= 0) rawMasks[c][i] = 1;
         }
 
         const detections = [];
         for (let c = 0; c < 3; c++) {
             if (c === 0 && !includeGreen) continue;
-            const mask = masks[c], visited = new Uint8Array(W * H);
+            const mask = erodeMask(rawMasks[c], W, H);
+            const visited = new Uint8Array(W * H);
+
             for (let y = 0; y < H; y++) {
                 for (let x = 0; x < W; x++) {
                     const seed = y * W + x;
@@ -324,7 +381,7 @@ function processFrame() {
                     const solidity = pixelCount / (bw * bh);
                     const aspect = bw / bh;
 
-                    if (pixelCount >= 220 && solidity > 0.44 && aspect > 0.55 && aspect < 1.8) {
+                    if (pixelCount >= 180 && solidity > 0.44 && aspect > 0.55 && aspect < 1.8) {
                         const cx = sumX / pixelCount;
                         const cy = sumY / pixelCount;
                         const eqDiameterPx = 2 * Math.sqrt(pixelCount / Math.PI);
@@ -340,35 +397,43 @@ function processFrame() {
 
         cv.width = srcW;
         cv.height = srcH;
-        wctx.putImageData(depthFrame, 0, 0);
         ctx.clearRect(0, 0, cv.width, cv.height);
-        ctx.drawImage(work, 0, 0, cv.width, cv.height);
+
+        // Renderiza mapa de profundidad o cámara en color real según el botón 'Vista'
+        if (showDepthView) {
+            wctx.putImageData(depthFrame, 0, 0);
+            ctx.drawImage(work, 0, 0, cv.width, cv.height);
+        } else {
+            ctx.drawImage(srcEl, 0, 0, cv.width, cv.height);
+        }
 
         const mode = $('mode').value;
         const dMinCM = parseFloat($('dmin').value) || 15;
         const dMaxCM = parseFloat($('dmax').value) || 60;
         const typicalD_mm = parseFloat($('D').value) || 65;
+        const refPlaneZ_mm = (parseFloat($('cal').value) || 30) * 10;
         const focalPx_W = focalFactor * W;
 
         let countOk = 0, countMad = 0, countPin = 0, countOut = 0;
+        const exportRows = [];
         const sx = cv.width / W, sy = cv.height / H;
         const fontSize = Math.max(13, Math.round(cv.width / 48));
         ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
 
-        for (const d of detections.slice(0, 12)) {
+        detections.slice(0, 12).forEach((d, idx) => {
             let distCM = 30;
             let diamMM = typicalD_mm;
+            const compensatedDiameterPx = d.eqDiameterPx * 1.12;
 
             if (mode === 'depth' && extDepthData) {
                 const nearCM = parseFloat($('mNear').value) || 10;
                 const farCM = parseFloat($('mFar').value) || 100;
                 distCM = farCM - (d.meanZ / 255) * (farCM - nearCM);
-                diamMM = (d.eqDiameterPx * (distCM * 10)) / focalPx_W;
+                diamMM = (compensatedDiameterPx * (distCM * 10)) / focalPx_W;
             } else {
-                const rawDistMM = (typicalD_mm * focalPx_W) / d.eqDiameterPx;
+                const rawDistMM = (typicalD_mm * focalPx_W) / compensatedDiameterPx;
                 distCM = rawDistMM / 10;
-                const calZ_mm = (parseFloat($('cal').value) || 30) * 10;
-                diamMM = (d.eqDiameterPx * calZ_mm) / focalPx_W;
+                diamMM = (compensatedDiameterPx * refPlaneZ_mm) / focalPx_W;
             }
 
             const inRange = (mode === 'off') || (distCM >= dMinCM && distCM <= dMaxCM);
@@ -381,9 +446,18 @@ function processFrame() {
                 countOut++;
             }
 
+            const diamCM = (diamMM / 10).toFixed(1);
+            exportRows.push({
+                id: idx + 1,
+                madurez: COLORS[d.c].name,
+                diametro: diamCM,
+                distancia: distCM.toFixed(1),
+                estado: inRange ? 'Aceptado' : 'Fuera_de_rango'
+            });
+
             const realCx = d.cx * sx;
             const realCy = d.cy * sy;
-            const realRadius = (d.eqDiameterPx / 2) * ((sx + sy) / 2);
+            const realRadius = (compensatedDiameterPx / 2) * ((sx + sy) / 2);
             const strokeColor = inRange ? COLORS[d.c].rgb : '#7a827d';
 
             ctx.save();
@@ -409,7 +483,6 @@ function processFrame() {
                 ctx.fill();
             }
 
-            const diamCM = (diamMM / 10).toFixed(1);
             const label = inRange
                 ? `${COLORS[d.c].name} · Ø ${diamCM} cm · ${distCM.toFixed(0)} cm`
                 : `Fuera de rango (${distCM.toFixed(0)} cm)`;
@@ -423,8 +496,9 @@ function processFrame() {
             ctx.fillRect(lx, ly, textW, labelH);
             ctx.fillStyle = strokeColor;
             ctx.fillText(label, lx + 6, ly + fontSize);
-        }
+        });
 
+        lastExportRows = exportRows;
         $('nOk').textContent = countOk;
         $('nMad').textContent = countMad;
         $('nPin').textContent = countPin;
