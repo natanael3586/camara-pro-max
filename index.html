@@ -21,6 +21,7 @@
 <div class="row">
   <button class="main" id="bCam">Abrir cámara</button>
   <button id="bFlip" disabled>Voltear cámara</button>
+  <button id="bView">Vista: Profundidad</button>
   <button id="bPhoto">Subir foto</button>
   <button id="bDemo">Escena de ejemplo</button>
 </div>
@@ -28,7 +29,10 @@
 <input type="file" id="fDepth" accept="image/*" hidden>
 
 <div class="card">
-  <h2>Resultado</h2>
+  <div class="card-head">
+    <h2>Resultado</h2>
+    <button id="bCsv" class="btn-sm">Exportar CSV</button>
+  </div>
   <div class="stats">
     <div><strong id="nOk">0</strong><span>aceptados</span></div>
     <div><strong id="nMad">0</strong><span>maduros</span></div>
@@ -68,10 +72,10 @@
   </div>
   <div class="row"><button id="bCal">Calibrar con el jitomate más grande</button></div>
   <label><input type="checkbox" id="green"> Incluir jitomates verdes (puede confundirse con hojas)</label>
-  <p class="note" id="fnote">Foco estimado: 0.78 × ancho de imagen.</p>
+  <p class="note" id="fnote">Foco estimado: 0.58 × ancho de imagen.</p>
 </div>
 
-<p class="note">Versión prototipo: la detección usa color y forma. Para mayor precisión, entrena un modelo con tus fotos y reemplaza la función <code>detect</code>.</p>
+<p class="note">Versión prototipo: la detección usa segmentación HSV, erosión morfológica y metrología óptica.</p>
 </main>
 
 <script src="app.js"></script>
