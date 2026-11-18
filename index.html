@@ -71,11 +71,16 @@
     <div><label for="cal">Distancia real (cm)</label><input type="number" id="cal" value="30"></div>
   </div>
   <div class="row"><button id="bCal">Calibrar con el jitomate más grande</button></div>
+  <label for="wb">Balance de blancos (luz solar)</label>
+  <select id="wb">
+    <option value="auto">Automático (recomendado al sol)</option>
+    <option value="off">Desactivado</option>
+  </select>
   <label><input type="checkbox" id="green"> Incluir jitomates verdes (puede confundirse con hojas)</label>
   <p class="note" id="fnote">Foco estimado: 0.58 × ancho de imagen.</p>
 </div>
 
-<p class="note">Versión prototipo: la detección usa segmentación HSV, erosión morfológica y metrología óptica.</p>
+<p class="note">Versión prototipo: segmentación en CIELAB con máscaras, relleno de reflejos y metrología óptica. * = fruto tapado o pegado (se mide con el círculo inscrito).</p>
 </main>
 
 <script src="app.js"></script>
