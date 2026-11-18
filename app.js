@@ -1,513 +1,338 @@
 'use strict';
 const $ = id => document.getElementById(id);
-
-const cv = $('cv');
-const ctx = cv.getContext('2d', { willReadFrequently: true });
-const work = document.createElement('canvas');
-const wctx = work.getContext('2d', { willReadFrequently: true });
+const cv = $('cv'), ctx = cv.getContext('2d', { willReadFrequently: true });
+const work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
+const ovc = document.createElement('canvas'), octx = ovc.getContext('2d');
 const vid = document.createElement('video');
-vid.muted = true;
-vid.playsInline = true;
+vid.muted = true; vid.playsInline = true;
 
-let stream = null;
-let facingMode = 'environment'; // 'environment' = trasera, 'user' = frontal
-let showDepthView = true;       // Alterna entre mapa de profundidad y color RGB real
-let timer = null;
-let busy = false;
-let currentSource = null;
-let staticImg = null;
-let customDepthImg = null;
-let focalFactor = 0.58;
-let lastDetections = [];
-let lastExportRows = [];
+let stream = null, facingMode = 'environment', timer = null, busy = false;
+let currentSource = null, staticImg = null, customDepthImg = null;
+let focalFactor = 0.58, lastDetections = [], lastExportRows = [], viewMask = false;
+let depthCache = null;
 
-const COLORS = [
-    { key: 'green', name: 'Verde', rgb: '#64e991' },
-    { key: 'turning', name: 'Pintón', rgb: '#ffc06b' },
-    { key: 'red', name: 'Maduro', rgb: '#ff7777' }
+const CLS = [
+    { name: 'Verde', rgb: [100, 233, 145] },
+    { name: 'Pintón', rgb: [255, 192, 107] },
+    { name: 'Maduro', rgb: [255, 90, 90] }
 ];
+const status = m => { $('st').textContent = m; };
 
-function status(msg) {
-    const el = $('st');
-    if (el) el.textContent = msg;
+// ---------- Color: sRGB -> CIELAB (D65) ----------
+const LIN = new Float32Array(256);
+for (let i = 0; i < 256; i++) { const c = i / 255; LIN[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+const fLab = t => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+function toLab(r, g, b, out) {
+    const R = LIN[r], G = LIN[g], B = LIN[b];
+    const fx = fLab((0.4124 * R + 0.3576 * G + 0.1805 * B) / 0.95047);
+    const fy = fLab(0.2126 * R + 0.7152 * G + 0.0722 * B);
+    const fz = fLab((0.0193 * R + 0.1192 * G + 0.9505 * B) / 1.08883);
+    out[0] = 116 * fy - 16; out[1] = 500 * (fx - fy); out[2] = 200 * (fy - fz);
 }
+const hueOf = (a, b) => { const h = Math.atan2(b, a) * 57.29578; return h < 0 ? h + 360 : h; };
 
-// --- CONTROLES DE INTERFAZ ---
-$('dmin').addEventListener('input', e => {
-    $('vMin').textContent = `${e.target.value} cm`;
-    if (currentSource && currentSource !== 'cam') processFrame();
-});
-
-$('dmax').addEventListener('input', e => {
-    $('vMax').textContent = `${e.target.value} cm`;
-    if (currentSource && currentSource !== 'cam') processFrame();
-});
-
-$('mode').addEventListener('change', e => {
-    const val = e.target.value;
-    $('depthBox').hidden = (val !== 'depth');
-    $('estNote').hidden = (val !== 'est');
-    if (currentSource && currentSource !== 'cam') processFrame();
-});
-
-$('green').addEventListener('change', () => {
-    if (currentSource && currentSource !== 'cam') processFrame();
-});
-
-const btnView = $('bView');
-if (btnView) {
-    btnView.addEventListener('click', () => {
-        showDepthView = !showDepthView;
-        btnView.textContent = showDepthView ? 'Vista: Profundidad' : 'Vista: Color real';
-        status(showDepthView ? 'Mostrando mapa de profundidad' : 'Mostrando imagen en color real');
-        if (currentSource && currentSource !== 'cam') {
-            busy = false;
-            processFrame();
-        }
-    });
-}
-
-// --- EXPORTAR RESULTADOS A CSV ---
-const btnCsv = $('bCsv');
-if (btnCsv) {
-    btnCsv.addEventListener('click', () => {
-        if (!lastExportRows.length) {
-            status('No hay detecciones actuales para exportar.');
-            return;
-        }
-        const headers = ['ID', 'Madurez', 'Diametro_cm', 'Distancia_cm', 'Estado'];
-        const csvLines = [
-            headers.join(','),
-            ...lastExportRows.map(r => `${r.id},${r.madurez},${r.diametro},${r.distancia},${r.estado}`)
-        ];
-        const blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `jitomates_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
-        link.click();
-        status('Archivo CSV descargado.');
-    });
-}
-
-// --- CÁMARA ---
-async function startCamera() {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        status('Tu navegador no soporta acceso a la cámara o requiere HTTPS.');
-        return;
+// Balance de blancos (gray-world recortado, con ganancias limitadas para no "borrar" el rojo)
+function whiteBalance(d, n) {
+    let sr = 0, sg = 0, sb = 0, k = 0, clip = 0;
+    for (let i = 0; i < n; i++) {
+        const p = i * 4, r = d[p], g = d[p + 1], b = d[p + 2], mx = Math.max(r, g, b);
+        if (mx >= 250) clip++;
+        if (mx < 30 || mx >= 250) continue;
+        sr += r; sg += g; sb += b; k++;
     }
+    if (!k) return { g: [1, 1, 1], clip: clip / n };
+    const m = (sr + sg + sb) / 3, cl = v => Math.max(0.8, Math.min(1.25, m / v));
+    return { g: [cl(sr), cl(sg), cl(sb)], clip: clip / n };
+}
+
+// ---------- Morfología ----------
+function erode(m, W, H) {
+    const o = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+        const i = y * W + x;
+        if (m[i] && m[i - 1] && m[i + 1] && m[i - W] && m[i + W]) o[i] = 1;
+    }
+    return o;
+}
+function dilate(m, W, H) {
+    const o = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+        const i = y * W + x;
+        if (m[i] || m[i - 1] || m[i + 1] || m[i - W] || m[i + W]) o[i] = 1;
+    }
+    return o;
+}
+// Rellena huecos (reflejos solares) = fondo no conectado con el borde
+function fillHoles(m, W, H) {
+    const bg = new Uint8Array(W * H), st = [];
+    const push = i => { if (!m[i] && !bg[i]) { bg[i] = 1; st.push(i); } };
+    for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
+    for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
+    while (st.length) {
+        const p = st.pop(), x = p % W;
+        if (x > 0) push(p - 1);
+        if (x < W - 1) push(p + 1);
+        if (p >= W) push(p - W);
+        if (p < W * (H - 1)) push(p + W);
+    }
+    const o = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) o[i] = bg[i] ? 0 : 1;
+    return o;
+}
+
+// Radio inscrito (transformada de distancia) para frutos tapados o pegados
+function inscribed(pix, W, bx, by, bw, bh, fm) {
+    const w = bw + 2, h = bh + 2, dt = new Float32Array(w * h);
+    for (const p of pix) dt[(((p / W) | 0) - by + 1) * w + (p % W) - bx + 1] = 1e4;
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x; if (!dt[i]) continue;
+        dt[i] = Math.min(dt[i], dt[i - 1] + 1, dt[i - w] + 1, dt[i - w - 1] + 1.414, dt[i - w + 1] + 1.414);
+    }
+    let best = 0, bi = 0;
+    for (let y = h - 2; y >= 1; y--) for (let x = w - 2; x >= 1; x--) {
+        const i = y * w + x; if (!dt[i]) continue;
+        dt[i] = Math.min(dt[i], dt[i + 1] + 1, dt[i + w] + 1, dt[i + w + 1] + 1.414, dt[i + w - 1] + 1.414);
+        if (dt[i] > best) { best = dt[i]; bi = i; }
+    }
+    return { r: best, cx: (bi % w) + bx - 1, cy: ((bi / w) | 0) + by - 1 };
+}
+
+const hex = (r, g, b) => '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
+
+// ---------- Procesamiento ----------
+function processFrame() {
+    if (busy || !currentSource) return;
+    let src, sw, sh;
+    if (currentSource === 'cam') {
+        if (!stream || vid.readyState < 2) return;
+        src = vid; sw = vid.videoWidth; sh = vid.videoHeight;
+    } else if (staticImg) {
+        src = staticImg; sw = staticImg.naturalWidth || staticImg.width; sh = staticImg.naturalHeight || staticImg.height;
+    }
+    if (!src || !sw || !sh) return;
+    busy = true;
+    try {
+        const W = currentSource === 'cam' ? 400 : 640, H = Math.max(120, Math.round(W * sh / sw)), N = W * H;
+        work.width = W; work.height = H;
+        wctx.drawImage(src, 0, 0, W, H);
+        const raw = wctx.getImageData(0, 0, W, H).data;
+        const includeGreen = $('green').checked;
+        const wb = $('wb').value === 'auto' ? whiteBalance(raw, N) : { g: [1, 1, 1], clip: 0 };
+        if ($('wb').value !== 'auto') { let c = 0; for (let i = 0; i < N; i++) { const p = i * 4; if (Math.max(raw[p], raw[p + 1], raw[p + 2]) >= 250) c++; } wb.clip = c / N; }
+
+        // 1) Máscara en CIELAB (L*, croma y matiz: mucho más estable al sol que HSV)
+        const lab = [0, 0, 0], L = new Float32Array(N), A = new Float32Array(N), B = new Float32Array(N);
+        let mask = new Uint8Array(N), gmask = new Uint8Array(N);
+        for (let i = 0; i < N; i++) {
+            const p = i * 4;
+            toLab(Math.min(255, Math.round(raw[p] * wb.g[0])), Math.min(255, Math.round(raw[p + 1] * wb.g[1])), Math.min(255, Math.round(raw[p + 2] * wb.g[2])), lab);
+            L[i] = lab[0]; A[i] = lab[1]; B[i] = lab[2];
+            const C = Math.hypot(lab[1], lab[2]), h = hueOf(lab[1], lab[2]);
+            if (lab[0] < 14 || lab[0] > 92) continue;
+            if (C >= 30 && (h <= 88 || h >= 345)) mask[i] = 1;
+            else if (includeGreen && C >= 26 && h >= 105 && h <= 150) gmask[i] = 1;
+        }
+        const clean = m => fillHoles(dilate(erode(dilate(erode(m, W, H), W, H), W, H), W, H), W, H);
+        const fmR = clean(mask), fmG = includeGreen ? clean(gmask) : null;
+
+        // 2) Componentes -> medición
+        const minArea = 0.003 * N, dets = [];
+        const segment = (fm, isGreen) => {
+            const vis = new Uint8Array(N);
+            for (let s = 0; s < N; s++) {
+                if (!fm[s] || vis[s]) continue;
+                const st = [s], pix = []; vis[s] = 1;
+                let minx = W, maxx = 0, miny = H, maxy = 0;
+                while (st.length) {
+                    const p = st.pop(), x = p % W, y = (p / W) | 0; pix.push(p);
+                    if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+                    if (x > 0 && fm[p - 1] && !vis[p - 1]) { vis[p - 1] = 1; st.push(p - 1); }
+                    if (x < W - 1 && fm[p + 1] && !vis[p + 1]) { vis[p + 1] = 1; st.push(p + 1); }
+                    if (y > 0 && fm[p - W] && !vis[p - W]) { vis[p - W] = 1; st.push(p - W); }
+                    if (y < H - 1 && fm[p + W] && !vis[p + W]) { vis[p + W] = 1; st.push(p + W); }
+                }
+                const area = pix.length; if (area < minArea) continue;
+                const bw = maxx - minx + 1, bh = maxy - miny + 1, asp = bw / bh;
+                if (area / (bw * bh) < 0.5) continue;
+                const ins = inscribed(pix, W, minx, miny, bw, bh, fm);
+                const dA = 2 * Math.sqrt(area / Math.PI), ratio = area / (Math.PI * ins.r * ins.r);
+                const touching = ratio > 1.3 || asp > 1.5 || asp < 0.67;
+                if (ratio > 2.6) continue;
+                const dPx = touching ? 2 * ins.r + 1 : dA;       // tapado/pegado: círculo inscrito
+                let sa = 0, sb = 0, sl = 0, k = 0, rr = 0, gg = 0, bb = 0, cx = 0, cy = 0, zs = 0;
+                for (const p of pix) {
+                    cx += p % W; cy += (p / W) | 0;
+                    if (L[p] >= 22 && L[p] <= 85) {              // sin brillos ni sombras profundas
+                        sa += A[p]; sb += B[p]; sl += L[p]; k++;
+                        rr += raw[p * 4]; gg += raw[p * 4 + 1]; bb += raw[p * 4 + 2];
+                    }
+                }
+                if (k < area * 0.25) continue;
+                const hue = isGreen ? 130 : hueOf(sa / k, sb / k);
+                const c = isGreen ? 0 : (hue <= 52 || hue >= 345 ? 2 : 1);
+                dets.push({
+                    c, pix, area, dPx, touching, solid: Math.min(1, 1 / ratio), hue, C: Math.hypot(sa / k, sb / k),
+                    Lm: sl / k, am: sa / k, bm: sb / k, rgb: [rr / k, gg / k, bb / k],
+                    cx: touching ? ins.cx : cx / area, cy: touching ? ins.cy : cy / area, fm, W, H
+                });
+            }
+        };
+        segment(fmR, false);
+        if (fmG) segment(fmG, true);
+
+        // 3) Profundidad externa (solo si hay mapa)
+        const mode = $('mode').value;
+        let ext = null;
+        if (mode === 'depth' && customDepthImg) {
+            if (!depthCache || depthCache.W !== W || depthCache.H !== H || depthCache.img !== customDepthImg) {
+                const c = document.createElement('canvas'); c.width = W; c.height = H;
+                const x = c.getContext('2d'); x.drawImage(customDepthImg, 0, 0, W, H);
+                depthCache = { W, H, img: customDepthImg, d: x.getImageData(0, 0, W, H).data };
+            }
+            ext = depthCache.d;
+        }
+        dets.sort((a, b) => b.area - a.area);
+        lastDetections = dets;
+
+        // 4) Dibujo: la imagen real queda intacta; la máscara va aparte
+        cv.width = sw; cv.height = sh;
+        ctx.drawImage(src, 0, 0, sw, sh);
+        const sx = sw / W, sy = sh / H;
+        const dMin = parseFloat($('dmin').value) || 15, dMax = parseFloat($('dmax').value) || 60;
+        const typD = parseFloat($('D').value) || 65, refZ = (parseFloat($('cal').value) || 30) * 10;
+        const fx = focalFactor * W;
+        const ov = octx.createImageData(W, H); ovc.width = W; ovc.height = H;
+        let nOk = 0, nMad = 0, nPin = 0, nOut = 0; const rows = [];
+        const fs = Math.max(13, Math.round(sw / 48)); ctx.font = `bold ${fs}px system-ui, sans-serif`;
+
+        dets.slice(0, 15).forEach((d, idx) => {
+            let dist, diamMM;
+            if (ext) {
+                let zs = 0; for (const p of d.pix) zs += ext[p * 4];
+                const near = parseFloat($('mNear').value) || 10, far = parseFloat($('mFar').value) || 100;
+                dist = far - (zs / d.pix.length / 255) * (far - near);
+                diamMM = d.dPx * dist * 10 / fx;
+            } else {
+                dist = (typD * fx / d.dPx) / 10;
+                diamMM = d.dPx * refZ / fx;
+            }
+            const inRange = mode === 'off' || (dist >= dMin && dist <= dMax);
+            if (inRange) { nOk++; if (d.c === 2) nMad++; if (d.c === 1) nPin++; } else nOut++;
+            const col = inRange ? CLS[d.c].rgb : [122, 130, 125], real = hex(...d.rgb);
+            for (const p of d.pix) {
+                const x = p % W, edge = !(d.fm[p - 1] && d.fm[p + 1] && d.fm[p - W] && d.fm[p + W]);
+                const o = p * 4;
+                if (edge) { ov.data[o] = col[0]; ov.data[o + 1] = col[1]; ov.data[o + 2] = col[2]; ov.data[o + 3] = 255; }
+                else if (viewMask) { ov.data[o] = col[0]; ov.data[o + 1] = col[1]; ov.data[o + 2] = col[2]; ov.data[o + 3] = 120; }
+            }
+            rows.push({ id: idx + 1, madurez: CLS[d.c].name, diametro: (diamMM / 10).toFixed(2), distancia: dist.toFixed(1),
+                color: real, L: d.Lm.toFixed(1), a: d.am.toFixed(1), b: d.bm.toFixed(1), matiz: d.hue.toFixed(0),
+                ocluido: d.touching ? 'si' : 'no', estado: inRange ? 'Aceptado' : 'Fuera_de_rango' });
+            d._lbl = { x: d.cx * sx, y: d.cy * sy, r: d.dPx / 2 * (sx + sy) / 2, inRange, col, real, dist, diam: (diamMM / 10).toFixed(1), tw: d.touching };
+        });
+        octx.putImageData(ov, 0, 0);
+        ctx.imageSmoothingEnabled = false; ctx.drawImage(ovc, 0, 0, sw, sh); ctx.imageSmoothingEnabled = true;
+
+        dets.slice(0, 15).forEach(d => {
+            const l = d._lbl, css = `rgb(${l.col.join(',')})`;
+            const t = l.inRange ? `${CLS[d.c].name} · Ø ${l.diam} cm${l.tw ? '*' : ''} · ${l.dist.toFixed(0)} cm` : `Fuera de rango (${l.dist.toFixed(0)} cm)`;
+            const tw = ctx.measureText(t).width + fs + 18, lh = fs + 8;
+            const lx = Math.max(4, Math.min(sw - tw - 4, l.x - tw / 2)), ly = Math.max(4, l.y - l.r - lh - 5);
+            ctx.fillStyle = 'rgba(10,18,14,.88)'; ctx.fillRect(lx, ly, tw, lh);
+            ctx.fillStyle = l.real; ctx.fillRect(lx + 4, ly + 4, fs, fs);          // color real medido
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.strokeRect(lx + 4, ly + 4, fs, fs);
+            ctx.fillStyle = css; ctx.fillText(t, lx + fs + 10, ly + fs);
+        });
+
+        lastExportRows = rows;
+        $('nOk').textContent = nOk; $('nMad').textContent = nMad; $('nPin').textContent = nPin; $('nOut').textContent = nOut;
+        if (wb.clip > 0.12) status(`⚠ ${(wb.clip * 100).toFixed(0)}% de la imagen está sobreexpuesta: baja la exposición o haz sombra con tu cuerpo.`);
+        else if (currentSource === 'cam') status(`Cámara activa · WB ${$('wb').value === 'auto' ? 'auto' : 'off'} · ${dets.length} fruto(s)`);
+    } catch (e) { console.error(e); status('Error al procesar el fotograma.'); }
+    finally { busy = false; }
+}
+
+// ---------- Cámara ----------
+async function startCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) { status('Tu navegador no soporta la cámara o requiere HTTPS.'); return; }
     try {
         status('Solicitando acceso a la cámara...');
-        stream = await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: {
-                facingMode: { ideal: facingMode },
-                width: { ideal: 1280 },
-                height: { ideal: 720 }
-            }
-        });
-        vid.srcObject = stream;
-        await vid.play();
-        currentSource = 'cam';
-        $('hint').hidden = true;
-        $('bCam').textContent = 'Detener cámara';
-        if ($('bFlip')) $('bFlip').disabled = false;
-        status(`Cámara activa (${facingMode === 'user' ? 'Frontal' : 'Trasera'}) · Metrología HSV`);
-        timer = setInterval(processFrame, 110);
-    } catch (err) {
-        console.error('Error detallado de cámara:', err);
-        status(`No se pudo abrir la cámara (${err.name}: ${err.message}).`);
-        stopCamera();
-    }
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+        // Bajar exposición a pleno sol (si el dispositivo lo permite)
+        try {
+            const tr = stream.getVideoTracks()[0], cap = tr.getCapabilities ? tr.getCapabilities() : {};
+            const adv = {};
+            if (cap.exposureCompensation) adv.exposureCompensation = Math.max(cap.exposureCompensation.min, Math.min(cap.exposureCompensation.max, -1));
+            if (cap.whiteBalanceMode && cap.whiteBalanceMode.includes('continuous')) adv.whiteBalanceMode = 'continuous';
+            if (Object.keys(adv).length) await tr.applyConstraints({ advanced: [adv] });
+        } catch (_) { /* opcional */ }
+        vid.srcObject = stream; await vid.play();
+        currentSource = 'cam'; $('hint').hidden = true;
+        $('bCam').textContent = 'Detener cámara'; $('bFlip').disabled = false;
+        timer = setInterval(processFrame, 140);
+    } catch (e) { console.error(e); status(`No se pudo abrir la cámara (${e.name}: ${e.message}).`); stopCamera(); }
 }
-
-async function toggleCamera() {
-    if (stream) {
-        stopCamera();
-        status('Cámara detenida.');
-        return;
-    }
-    await startCamera();
-}
-
 function stopCamera() {
     if (timer) { clearInterval(timer); timer = null; }
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    vid.srcObject = null;
-    $('bCam').textContent = 'Abrir cámara';
-    if ($('bFlip')) $('bFlip').disabled = true;
-    if (!staticImg && currentSource === 'cam') {
-        $('hint').hidden = false;
-        currentSource = null;
-    }
+    vid.srcObject = null; $('bCam').textContent = 'Abrir cámara'; $('bFlip').disabled = true;
+    if (!staticImg && currentSource === 'cam') { $('hint').hidden = false; currentSource = null; }
 }
+const redo = () => { if (currentSource && currentSource !== 'cam') processFrame(); };
 
-$('bCam').addEventListener('click', toggleCamera);
+document.addEventListener('DOMContentLoaded', () => {
+    $('bCam').addEventListener('click', () => stream ? (stopCamera(), status('Cámara detenida.')) : startCamera());
+    $('bFlip').addEventListener('click', async () => { if (!stream) return; facingMode = facingMode === 'environment' ? 'user' : 'environment'; stopCamera(); await startCamera(); });
+    $('dmin').addEventListener('input', e => { $('vMin').textContent = `${e.target.value} cm`; redo(); });
+    $('dmax').addEventListener('input', e => { $('vMax').textContent = `${e.target.value} cm`; redo(); });
+    $('mode').addEventListener('change', e => { $('depthBox').hidden = e.target.value !== 'depth'; $('estNote').hidden = e.target.value !== 'est'; redo(); });
+    $('green').addEventListener('change', redo);
+    $('wb').addEventListener('change', redo);
+    $('bView').textContent = 'Vista: Real (contorno)';
+    $('bView').addEventListener('click', () => { viewMask = !viewMask; $('bView').textContent = viewMask ? 'Vista: Máscara' : 'Vista: Real (contorno)'; redo(); });
 
-const btnFlip = $('bFlip');
-if (btnFlip) {
-    btnFlip.addEventListener('click', async () => {
-        if (!stream) return;
-        facingMode = (facingMode === 'environment') ? 'user' : 'environment';
-        stopCamera();
-        await startCamera();
+    $('bCsv').addEventListener('click', () => {
+        if (!lastExportRows.length) { status('No hay detecciones para exportar.'); return; }
+        const h = ['ID', 'Madurez', 'Diametro_cm', 'Distancia_cm', 'Color_real_hex', 'L*', 'a*', 'b*', 'Matiz_deg', 'Ocluido', 'Estado'];
+        const lines = [h.join(','), ...lastExportRows.map(r => [r.id, r.madurez, r.diametro, r.distancia, r.color, r.L, r.a, r.b, r.matiz, r.ocluido, r.estado].join(','))];
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' }));
+        a.download = `jitomates_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`; a.click();
+        status('CSV descargado.');
     });
-}
 
-// --- SUBIR FOTO Y MAPA DE PROFUNDIDAD ---
-$('bPhoto').addEventListener('click', () => $('fPhoto').click());
-$('fPhoto').addEventListener('change', e => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    stopCamera();
-    const img = new Image();
-    img.onload = () => {
-        staticImg = img;
-        currentSource = 'img';
-        $('hint').hidden = true;
-        status('Foto cargada · Analizando');
-        processFrame();
-    };
-    img.src = URL.createObjectURL(file);
+    const loadImg = (file, cb) => { const img = new Image(); img.onload = () => cb(img); img.src = URL.createObjectURL(file); };
+    $('bPhoto').addEventListener('click', () => $('fPhoto').click());
+    $('fPhoto').addEventListener('change', e => {
+        const f = e.target.files?.[0]; if (!f) return; stopCamera();
+        loadImg(f, img => { staticImg = img; currentSource = 'img'; $('hint').hidden = true; status('Foto cargada · analizando'); processFrame(); });
+    });
+    $('bDepth').addEventListener('click', () => $('fDepth').click());
+    $('fDepth').addEventListener('change', e => {
+        const f = e.target.files?.[0]; if (!f) return;
+        loadImg(f, img => { customDepthImg = img; status('Mapa de profundidad cargado.'); if (currentSource) processFrame(); });
+    });
+
+    $('bDemo').addEventListener('click', () => {
+        stopCamera();
+        const c = document.createElement('canvas'); c.width = 640; c.height = 480;
+        const d = c.getContext('2d'); d.fillStyle = '#3a4a2a'; d.fillRect(0, 0, 640, 480);
+        for (const s of [{ x: 180, y: 240, r: 62, a: '#ff3b30', b: '#9e1911' }, { x: 370, y: 210, r: 46, a: '#ff9500', b: '#b35900' }, { x: 510, y: 270, r: 34, a: '#e0281e', b: '#7a100a' }]) {
+            const g = d.createRadialGradient(s.x - s.r * .3, s.y - s.r * .3, s.r * .1, s.x, s.y, s.r);
+            g.addColorStop(0, s.a); g.addColorStop(1, s.b); d.fillStyle = g;
+            d.beginPath(); d.arc(s.x, s.y, s.r, 0, 7); d.fill();
+            d.fillStyle = 'rgba(255,255,255,.9)'; d.beginPath(); d.ellipse(s.x - s.r * .35, s.y - s.r * .4, s.r * .15, s.r * .09, -.6, 0, 7); d.fill(); // brillo solar
+        }
+        const img = new Image();
+        img.onload = () => { staticImg = img; currentSource = 'demo'; $('hint').hidden = true; status('Escena de ejemplo (con reflejos) cargada'); processFrame(); };
+        img.src = c.toDataURL();
+    });
+
+    $('bCal').addEventListener('click', () => {
+        if (!lastDetections.length) { status('Detecta al menos un jitomate para calibrar.'); return; }
+        const d = lastDetections[0], D = parseFloat($('D').value) || 65, Z = (parseFloat($('cal').value) || 30) * 10;
+        focalFactor = Math.max(0.2, Math.min(2.5, (d.dPx * Z / D) / d.W));
+        $('fnote').textContent = `Foco calibrado: ${focalFactor.toFixed(2)} × ancho de imagen.`;
+        status(`Calibrado con fruto de ${D} mm a ${Z / 10} cm.`); redo();
+    });
 });
-
-$('bDepth').addEventListener('click', () => $('fDepth').click());
-$('fDepth').addEventListener('change', e => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const img = new Image();
-    img.onload = () => {
-        customDepthImg = img;
-        status('Mapa de profundidad externo cargado.');
-        if (currentSource) processFrame();
-    };
-    img.src = URL.createObjectURL(file);
-});
-
-// --- ESCENA DE EJEMPLO ---
-$('bDemo').addEventListener('click', () => {
-    stopCamera();
-    const demoCv = document.createElement('canvas');
-    demoCv.width = 640;
-    demoCv.height = 480;
-    const dctx = demoCv.getContext('2d');
-
-    dctx.fillStyle = '#1e2420';
-    dctx.fillRect(0, 0, 640, 480);
-
-    const samples = [
-        { x: 180, y: 240, r: 62, c1: '#ff3b30', c2: '#9e1911' },
-        { x: 370, y: 210, r: 46, c1: '#ff9500', c2: '#b35900' },
-        { x: 510, y: 270, r: 24, c1: '#e0281e', c2: '#7a100a' }
-    ];
-
-    for (const s of samples) {
-        const grad = dctx.createRadialGradient(s.x - s.r * 0.3, s.y - s.r * 0.3, s.r * 0.1, s.x, s.y, s.r);
-        grad.addColorStop(0, s.c1);
-        grad.addColorStop(1, s.c2);
-        dctx.fillStyle = grad;
-        dctx.beginPath();
-        dctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-        dctx.fill();
-    }
-
-    const img = new Image();
-    img.onload = () => {
-        staticImg = img;
-        currentSource = 'demo';
-        $('hint').hidden = true;
-        status('Escena de ejemplo cargada');
-        processFrame();
-    };
-    img.src = demoCv.toDataURL();
-});
-
-// --- CALIBRACIÓN FOCAL ---
-$('bCal').addEventListener('click', () => {
-    if (!lastDetections.length) {
-        status('Detecta al menos un jitomate para calibrar.');
-        return;
-    }
-    const largest = lastDetections[0];
-    const realD_mm = parseFloat($('D').value) || 65;
-    const realZ_mm = (parseFloat($('cal').value) || 30) * 10;
-    const compensatedDiameterPx = largest.eqDiameterPx * 1.12;
-    const newFocalPx = (compensatedDiameterPx * realZ_mm) / realD_mm;
-    focalFactor = Math.max(0.2, Math.min(2.5, newFocalPx / largest.W));
-    $('fnote').textContent = `Foco calibrado: ${focalFactor.toFixed(2)} × ancho de imagen.`;
-    status(`Calibrado con fruto de ${realD_mm} mm a ${realZ_mm / 10} cm.`);
-    if (currentSource !== 'cam') processFrame();
-});
-
-// --- CONVERSIÓN HSV Y CLASIFICACIÓN ROBUSTA EN SOMBRA ---
-function rgbToHsv(r, g, b) {
-    r /= 255; g /= 255; b /= 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b);
-    const d = max - min;
-    let h = 0;
-    if (d !== 0) {
-        if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
-        else if (max === g) h = ((b - r) / d + 2) * 60;
-        else h = ((r - g) / d + 4) * 60;
-    }
-    const s = max === 0 ? 0 : d / max;
-    return [h, s, max];
-}
-
-function classify(r, g, b, includeGreen) {
-    const [h, s, v] = rgbToHsv(r, g, b);
-    if (s < 0.32 || v < 0.12) return -1;
-    if ((h <= 15 || h >= 340) && s > 0.38) return 2; // Maduro
-    if (h > 15 && h <= 40 && s > 0.38) return 1;      // Pintón
-    if (includeGreen && h >= 65 && h <= 150 && s > 0.32) return 0; // Verde
-    return -1;
-}
-
-// Erosión morfológica de 1 px para separar frutos que se tocan ligeramente
-function erodeMask(mask, W, H) {
-    const out = new Uint8Array(W * H);
-    for (let y = 1; y < H - 1; y++) {
-        for (let x = 1; x < W - 1; x++) {
-            const idx = y * W + x;
-            if (mask[idx] && mask[idx - 1] && mask[idx + 1] && mask[idx - W] && mask[idx + W]) {
-                out[idx] = 1;
-            }
-        }
-    }
-    return out;
-}
-
-function depthColormap(val) {
-    const r = Math.min(255, Math.max(0, Math.round(1.5 * val - 128)));
-    const g = Math.min(255, Math.max(0, Math.round(255 - Math.abs(val - 128) * 2)));
-    const b = Math.min(255, Math.max(0, Math.round(255 - 1.5 * val)));
-    return [r, g, b];
-}
-
-// --- MOTOR DE VISIÓN Y METROLOGÍA ---
-function processFrame() {
-    if (busy || !currentSource) return;
-    let srcEl = null, srcW = 0, srcH = 0;
-
-    if (currentSource === 'cam') {
-        if (!stream || vid.readyState < 2) return;
-        srcEl = vid;
-        srcW = vid.videoWidth;
-        srcH = vid.videoHeight;
-    } else if (staticImg) {
-        srcEl = staticImg;
-        srcW = staticImg.naturalWidth || staticImg.width;
-        srcH = staticImg.naturalHeight || staticImg.height;
-    }
-    if (!srcEl || !srcW || !srcH) return;
-
-    busy = true;
-    try {
-        const W = 320;
-        const H = Math.max(180, Math.round(W * (srcH / srcW)));
-        work.width = W;
-        work.height = H;
-        wctx.drawImage(srcEl, 0, 0, W, H);
-
-        const rawData = wctx.getImageData(0, 0, W, H).data;
-        const depthFrame = wctx.createImageData(W, H);
-        const depthData = depthFrame.data;
-        const depthMap = new Float32Array(W * H);
-
-        let extDepthData = null;
-        if ($('mode').value === 'depth' && customDepthImg) {
-            const dCv = document.createElement('canvas');
-            dCv.width = W; dCv.height = H;
-            const dCtx = dCv.getContext('2d');
-            dCtx.drawImage(customDepthImg, 0, 0, W, H);
-            extDepthData = dCtx.getImageData(0, 0, W, H).data;
-        }
-
-        for (let i = 0; i < W * H; i++) {
-            const p = i * 4;
-            let zScore;
-            if (extDepthData) {
-                zScore = extDepthData[p];
-            } else {
-                const r = rawData[p], g = rawData[p + 1], b = rawData[p + 2];
-                const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-                const sat = Math.max(r, g, b) - Math.min(r, g, b);
-                zScore = Math.min(255, lum * 0.75 + sat * 0.35);
-            }
-            depthMap[i] = zScore;
-            const [dr, dg, db] = depthColormap(zScore);
-            depthData[p] = dr; depthData[p + 1] = dg; depthData[p + 2] = db; depthData[p + 3] = 255;
-        }
-
-        const includeGreen = $('green').checked;
-        const rawMasks = COLORS.map(() => new Uint8Array(W * H));
-        for (let i = 0; i < W * H; i++) {
-            const p = i * 4;
-            const c = classify(rawData[p], rawData[p + 1], rawData[p + 2], includeGreen);
-            if (c >= 0) rawMasks[c][i] = 1;
-        }
-
-        const detections = [];
-        for (let c = 0; c < 3; c++) {
-            if (c === 0 && !includeGreen) continue;
-            const mask = erodeMask(rawMasks[c], W, H);
-            const visited = new Uint8Array(W * H);
-
-            for (let y = 0; y < H; y++) {
-                for (let x = 0; x < W; x++) {
-                    const seed = y * W + x;
-                    if (!mask[seed] || visited[seed]) continue;
-
-                    let stack = [seed], pixelCount = 0;
-                    let sumX = 0, sumY = 0, zSum = 0;
-                    let minx = W, maxx = 0, miny = H, maxy = 0;
-                    visited[seed] = 1;
-
-                    while (stack.length) {
-                        const p = stack.pop(), px = p % W, py = (p / W) | 0;
-                        pixelCount++;
-                        sumX += px; sumY += py;
-                        zSum += depthMap[p];
-                        if (px < minx) minx = px; if (px > maxx) maxx = px;
-                        if (py < miny) miny = py; if (py > maxy) maxy = py;
-
-                        for (const n of [p - 1, p + 1, p - W, p + W]) {
-                            if (n < 0 || n >= W * H || visited[n] || !mask[n]) continue;
-                            if (Math.abs(n % W - px) + Math.abs(((n / W) | 0) - py) !== 1) continue;
-                            visited[n] = 1; stack.push(n);
-                        }
-                    }
-
-                    const bw = maxx - minx + 1, bh = maxy - miny + 1;
-                    const solidity = pixelCount / (bw * bh);
-                    const aspect = bw / bh;
-
-                    if (pixelCount >= 180 && solidity > 0.44 && aspect > 0.55 && aspect < 1.8) {
-                        const cx = sumX / pixelCount;
-                        const cy = sumY / pixelCount;
-                        const eqDiameterPx = 2 * Math.sqrt(pixelCount / Math.PI);
-                        const meanZ = zSum / pixelCount;
-                        detections.push({ c, cx, cy, eqDiameterPx, pixelCount, meanZ, W, H });
-                    }
-                }
-            }
-        }
-
-        detections.sort((a, b) => b.pixelCount - a.pixelCount);
-        lastDetections = detections;
-
-        cv.width = srcW;
-        cv.height = srcH;
-        ctx.clearRect(0, 0, cv.width, cv.height);
-
-        // Renderiza mapa de profundidad o cámara en color real según el botón 'Vista'
-        if (showDepthView) {
-            wctx.putImageData(depthFrame, 0, 0);
-            ctx.drawImage(work, 0, 0, cv.width, cv.height);
-        } else {
-            ctx.drawImage(srcEl, 0, 0, cv.width, cv.height);
-        }
-
-        const mode = $('mode').value;
-        const dMinCM = parseFloat($('dmin').value) || 15;
-        const dMaxCM = parseFloat($('dmax').value) || 60;
-        const typicalD_mm = parseFloat($('D').value) || 65;
-        const refPlaneZ_mm = (parseFloat($('cal').value) || 30) * 10;
-        const focalPx_W = focalFactor * W;
-
-        let countOk = 0, countMad = 0, countPin = 0, countOut = 0;
-        const exportRows = [];
-        const sx = cv.width / W, sy = cv.height / H;
-        const fontSize = Math.max(13, Math.round(cv.width / 48));
-        ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
-
-        detections.slice(0, 12).forEach((d, idx) => {
-            let distCM = 30;
-            let diamMM = typicalD_mm;
-            const compensatedDiameterPx = d.eqDiameterPx * 1.12;
-
-            if (mode === 'depth' && extDepthData) {
-                const nearCM = parseFloat($('mNear').value) || 10;
-                const farCM = parseFloat($('mFar').value) || 100;
-                distCM = farCM - (d.meanZ / 255) * (farCM - nearCM);
-                diamMM = (compensatedDiameterPx * (distCM * 10)) / focalPx_W;
-            } else {
-                const rawDistMM = (typicalD_mm * focalPx_W) / compensatedDiameterPx;
-                distCM = rawDistMM / 10;
-                diamMM = (compensatedDiameterPx * refPlaneZ_mm) / focalPx_W;
-            }
-
-            const inRange = (mode === 'off') || (distCM >= dMinCM && distCM <= dMaxCM);
-
-            if (inRange) {
-                countOk++;
-                if (d.c === 2) countMad++;
-                if (d.c === 1) countPin++;
-            } else {
-                countOut++;
-            }
-
-            const diamCM = (diamMM / 10).toFixed(1);
-            exportRows.push({
-                id: idx + 1,
-                madurez: COLORS[d.c].name,
-                diametro: diamCM,
-                distancia: distCM.toFixed(1),
-                estado: inRange ? 'Aceptado' : 'Fuera_de_rango'
-            });
-
-            const realCx = d.cx * sx;
-            const realCy = d.cy * sy;
-            const realRadius = (compensatedDiameterPx / 2) * ((sx + sy) / 2);
-            const strokeColor = inRange ? COLORS[d.c].rgb : '#7a827d';
-
-            ctx.save();
-            if (!inRange) ctx.setLineDash([6, 6]);
-            ctx.beginPath();
-            ctx.arc(realCx, realCy, realRadius, 0, Math.PI * 2);
-            ctx.strokeStyle = strokeColor;
-            ctx.lineWidth = inRange ? 3 : 2;
-            ctx.stroke();
-            ctx.restore();
-
-            if (inRange) {
-                ctx.beginPath();
-                ctx.moveTo(realCx - realRadius, realCy);
-                ctx.lineTo(realCx + realRadius, realCy);
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 2;
-                ctx.stroke();
-
-                ctx.beginPath();
-                ctx.arc(realCx, realCy, 3.5, 0, Math.PI * 2);
-                ctx.fillStyle = '#ffffff';
-                ctx.fill();
-            }
-
-            const label = inRange
-                ? `${COLORS[d.c].name} · Ø ${diamCM} cm · ${distCM.toFixed(0)} cm`
-                : `Fuera de rango (${distCM.toFixed(0)} cm)`;
-
-            const textW = ctx.measureText(label).width + 12;
-            const labelH = fontSize + 8;
-            const lx = Math.max(4, Math.min(cv.width - textW - 4, realCx - textW / 2));
-            const ly = Math.max(4, realCy - realRadius - labelH - 5);
-
-            ctx.fillStyle = 'rgba(10, 18, 14, 0.88)';
-            ctx.fillRect(lx, ly, textW, labelH);
-            ctx.fillStyle = strokeColor;
-            ctx.fillText(label, lx + 6, ly + fontSize);
-        });
-
-        lastExportRows = exportRows;
-        $('nOk').textContent = countOk;
-        $('nMad').textContent = countMad;
-        $('nPin').textContent = countPin;
-        $('nOut').textContent = countOut;
-
-    } catch (err) {
-        console.error(err);
-        status('Error al procesar el fotograma.');
-    } finally {
-        busy = false;
-    }
-}
