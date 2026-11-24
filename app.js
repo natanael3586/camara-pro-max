@@ -31,7 +31,7 @@ function toLab(r, g, b, out) {
 }
 const hueOf = (a, b) => { const h = Math.atan2(b, a) * 57.29578; return h < 0 ? h + 360 : h; };
 
-// Balance de blancos (gray-world recortado, con ganancias limitadas para no "borrar" el rojo)
+// Balance de blancos (gray-world recortado)
 function whiteBalance(d, n) {
     let sr = 0, sg = 0, sb = 0, k = 0, clip = 0;
     for (let i = 0; i < n; i++) {
@@ -62,7 +62,6 @@ function dilate(m, W, H) {
     }
     return o;
 }
-// Rellena huecos (reflejos solares) = fondo no conectado con el borde
 function fillHoles(m, W, H) {
     const bg = new Uint8Array(W * H), st = [];
     const push = i => { if (!m[i] && !bg[i]) { bg[i] = 1; st.push(i); } };
@@ -80,7 +79,7 @@ function fillHoles(m, W, H) {
     return o;
 }
 
-// Radio inscrito (transformada de distancia) para frutos tapados o pegados
+// Radio inscrito (transformada de distancia)
 function inscribed(pix, W, bx, by, bw, bh, fm) {
     const w = bw + 2, h = bh + 2, dt = new Float32Array(w * h);
     for (const p of pix) dt[(((p / W) | 0) - by + 1) * w + (p % W) - bx + 1] = 1e4;
@@ -116,11 +115,15 @@ function processFrame() {
         work.width = W; work.height = H;
         wctx.drawImage(src, 0, 0, W, H);
         const raw = wctx.getImageData(0, 0, W, H).data;
-        const includeGreen = $('green').checked;
+        
+        // Forzar verde activo por defecto
+        const greenEl = $('green');
+        const includeGreen = greenEl ? (greenEl.checked || true) : true;
+
         const wb = $('wb').value === 'auto' ? whiteBalance(raw, N) : { g: [1, 1, 1], clip: 0 };
         if ($('wb').value !== 'auto') { let c = 0; for (let i = 0; i < N; i++) { const p = i * 4; if (Math.max(raw[p], raw[p + 1], raw[p + 2]) >= 250) c++; } wb.clip = c / N; }
 
-        // 1) Máscara en CIELAB (L*, croma y matiz: mucho más estable al sol que HSV)
+        // 1) Máscara en CIELAB
         const lab = [0, 0, 0], L = new Float32Array(N), A = new Float32Array(N), B = new Float32Array(N);
         let mask = new Uint8Array(N), gmask = new Uint8Array(N);
         for (let i = 0; i < N; i++) {
@@ -129,8 +132,15 @@ function processFrame() {
             L[i] = lab[0]; A[i] = lab[1]; B[i] = lab[2];
             const C = Math.hypot(lab[1], lab[2]), h = hueOf(lab[1], lab[2]);
             if (lab[0] < 14 || lab[0] > 92) continue;
-            if (C >= 30 && (h <= 88 || h >= 345)) mask[i] = 1;
-            else if (includeGreen && C >= 26 && h >= 105 && h <= 150) gmask[i] = 1;
+            
+            // Rojos / Naranjas (Maduro / Pintón)
+            if (C >= 30 && (h <= 48 || h >= 345)) {
+                mask[i] = 1;
+            } 
+            // Verdes (Incluye verde puro y verde-limón/amarillento)
+            else if (includeGreen && C >= 18 && h >= 75 && h <= 150 && lab[0] > 25 && lab[0] < 90) {
+                gmask[i] = 1;
+            }
         }
         const clean = m => fillHoles(dilate(erode(dilate(erode(m, W, H), W, H), W, H), W, H), W, H);
         const fmR = clean(mask), fmG = includeGreen ? clean(gmask) : null;
@@ -153,23 +163,37 @@ function processFrame() {
                 }
                 const area = pix.length; if (area < minArea) continue;
                 const bw = maxx - minx + 1, bh = maxy - miny + 1, asp = bw / bh;
-                if (area / (bw * bh) < 0.5) continue;
+                const solidity = area / (bw * bh);
+                
+                if (isGreen) {
+                    if (solidity < 0.40 || asp < 0.50 || asp > 2.00) continue;
+                } else {
+                    if (solidity < 0.5) continue;
+                }
+
                 const ins = inscribed(pix, W, minx, miny, bw, bh, fm);
                 const dA = 2 * Math.sqrt(area / Math.PI), ratio = area / (Math.PI * ins.r * ins.r);
                 const touching = ratio > 1.3 || asp > 1.5 || asp < 0.67;
                 if (ratio > 2.6) continue;
-                const dPx = touching ? 2 * ins.r + 1 : dA;       // tapado/pegado: círculo inscrito
-                let sa = 0, sb = 0, sl = 0, k = 0, rr = 0, gg = 0, bb = 0, cx = 0, cy = 0, zs = 0;
+                const dPx = touching ? 2 * ins.r + 1 : dA;
+                let sa = 0, sb = 0, sl = 0, k = 0, rr = 0, gg = 0, bb = 0, cx = 0, cy = 0;
                 for (const p of pix) {
                     cx += p % W; cy += (p / W) | 0;
-                    if (L[p] >= 22 && L[p] <= 85) {              // sin brillos ni sombras profundas
+                    if (L[p] >= 20 && L[p] <= 90) {
                         sa += A[p]; sb += B[p]; sl += L[p]; k++;
                         rr += raw[p * 4]; gg += raw[p * 4 + 1]; bb += raw[p * 4 + 2];
                     }
                 }
-                if (k < area * 0.25) continue;
-                const hue = isGreen ? 130 : hueOf(sa / k, sb / k);
-                const c = isGreen ? 0 : (hue <= 52 || hue >= 345 ? 2 : 1);
+                if (k < area * 0.20) continue;
+                
+                const hue = hueOf(sa / k, sb / k);
+                let c = 2; // Maduro por defecto
+                if (isGreen) {
+                    c = 0; // Verde
+                } else if (hue > 36 && hue < 345) {
+                    c = 1; // Pintón
+                }
+
                 dets.push({
                     c, pix, area, dPx, touching, solid: Math.min(1, 1 / ratio), hue, C: Math.hypot(sa / k, sb / k),
                     Lm: sl / k, am: sa / k, bm: sb / k, rgb: [rr / k, gg / k, bb / k],
@@ -180,7 +204,7 @@ function processFrame() {
         segment(fmR, false);
         if (fmG) segment(fmG, true);
 
-        // 3) Profundidad externa (solo si hay mapa)
+        // 3) Profundidad externa
         const mode = $('mode').value;
         let ext = null;
         if (mode === 'depth' && customDepthImg) {
@@ -194,7 +218,7 @@ function processFrame() {
         dets.sort((a, b) => b.area - a.area);
         lastDetections = dets;
 
-        // 4) Dibujo: la imagen real queda intacta; la máscara va aparte
+        // 4) Dibujo
         cv.width = sw; cv.height = sh;
         ctx.drawImage(src, 0, 0, sw, sh);
         const sx = sw / W, sy = sh / H;
@@ -220,7 +244,7 @@ function processFrame() {
             if (inRange) { nOk++; if (d.c === 2) nMad++; if (d.c === 1) nPin++; } else nOut++;
             const col = inRange ? CLS[d.c].rgb : [122, 130, 125], real = hex(...d.rgb);
             for (const p of d.pix) {
-                const x = p % W, edge = !(d.fm[p - 1] && d.fm[p + 1] && d.fm[p - W] && d.fm[p + W]);
+                const edge = !(d.fm[p - 1] && d.fm[p + 1] && d.fm[p - W] && d.fm[p + W]);
                 const o = p * 4;
                 if (edge) { ov.data[o] = col[0]; ov.data[o + 1] = col[1]; ov.data[o + 2] = col[2]; ov.data[o + 3] = 255; }
                 else if (viewMask) { ov.data[o] = col[0]; ov.data[o + 1] = col[1]; ov.data[o + 2] = col[2]; ov.data[o + 3] = 120; }
@@ -239,14 +263,14 @@ function processFrame() {
             const tw = ctx.measureText(t).width + fs + 18, lh = fs + 8;
             const lx = Math.max(4, Math.min(sw - tw - 4, l.x - tw / 2)), ly = Math.max(4, l.y - l.r - lh - 5);
             ctx.fillStyle = 'rgba(10,18,14,.88)'; ctx.fillRect(lx, ly, tw, lh);
-            ctx.fillStyle = l.real; ctx.fillRect(lx + 4, ly + 4, fs, fs);          // color real medido
+            ctx.fillStyle = l.real; ctx.fillRect(lx + 4, ly + 4, fs, fs);
             ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.strokeRect(lx + 4, ly + 4, fs, fs);
             ctx.fillStyle = css; ctx.fillText(t, lx + fs + 10, ly + fs);
         });
 
         lastExportRows = rows;
         $('nOk').textContent = nOk; $('nMad').textContent = nMad; $('nPin').textContent = nPin; $('nOut').textContent = nOut;
-        if (wb.clip > 0.12) status(`⚠ ${(wb.clip * 100).toFixed(0)}% de la imagen está sobreexpuesta: baja la exposición o haz sombra con tu cuerpo.`);
+        if (wb.clip > 0.12) status(`⚠ ${(wb.clip * 100).toFixed(0)}% de la imagen está sobreexpuesta: baja la exposición o haz sombra.`);
         else if (currentSource === 'cam') status(`Cámara activa · WB ${$('wb').value === 'auto' ? 'auto' : 'off'} · ${dets.length} fruto(s)`);
     } catch (e) { console.error(e); status('Error al procesar el fotograma.'); }
     finally { busy = false; }
@@ -258,14 +282,13 @@ async function startCamera() {
     try {
         status('Solicitando acceso a la cámara...');
         stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } } });
-        // Bajar exposición a pleno sol (si el dispositivo lo permite)
         try {
             const tr = stream.getVideoTracks()[0], cap = tr.getCapabilities ? tr.getCapabilities() : {};
             const adv = {};
             if (cap.exposureCompensation) adv.exposureCompensation = Math.max(cap.exposureCompensation.min, Math.min(cap.exposureCompensation.max, -1));
             if (cap.whiteBalanceMode && cap.whiteBalanceMode.includes('continuous')) adv.whiteBalanceMode = 'continuous';
             if (Object.keys(adv).length) await tr.applyConstraints({ advanced: [adv] });
-        } catch (_) { /* opcional */ }
+        } catch (_) {}
         vid.srcObject = stream; await vid.play();
         currentSource = 'cam'; $('hint').hidden = true;
         $('bCam').textContent = 'Detener cámara'; $('bFlip').disabled = false;
@@ -321,10 +344,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const g = d.createRadialGradient(s.x - s.r * .3, s.y - s.r * .3, s.r * .1, s.x, s.y, s.r);
             g.addColorStop(0, s.a); g.addColorStop(1, s.b); d.fillStyle = g;
             d.beginPath(); d.arc(s.x, s.y, s.r, 0, 7); d.fill();
-            d.fillStyle = 'rgba(255,255,255,.9)'; d.beginPath(); d.ellipse(s.x - s.r * .35, s.y - s.r * .4, s.r * .15, s.r * .09, -.6, 0, 7); d.fill(); // brillo solar
+            d.fillStyle = 'rgba(255,255,255,.9)'; d.beginPath(); d.ellipse(s.x - s.r * .35, s.y - s.r * .4, s.r * .15, s.r * .09, -.6, 0, 7); d.fill();
         }
         const img = new Image();
-        img.onload = () => { staticImg = img; currentSource = 'demo'; $('hint').hidden = true; status('Escena de ejemplo (con reflejos) cargada'); processFrame(); };
+        img.onload = () => { staticImg = img; currentSource = 'demo'; $('hint').hidden = true; status('Escena de ejemplo cargada'); processFrame(); };
         img.src = c.toDataURL();
     });
 
